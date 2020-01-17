@@ -21,7 +21,7 @@ import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
 import org.apache.http.client.utils.URIBuilder;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
@@ -103,7 +103,7 @@ public class DestinationHttpClient {
 
     private CloseableHttpResponse getHttpResponse(BaseMessage message) throws Exception {
         URI uri = null;
-        HttpPost httpPostRequest = new HttpPost();
+        HttpPut httpPostRequest = new HttpPut();
         if (message instanceof CustomWebhookMessage) {
             CustomWebhookMessage customWebhookMessage = (CustomWebhookMessage) message;
             uri = buildUri(customWebhookMessage.getUrl(), customWebhookMessage.getScheme(), customWebhookMessage.getHost(),
