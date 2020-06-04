@@ -18,13 +18,18 @@ package com.amazon.opendistroforelasticsearch.alerting.resthandler
 import com.amazon.opendistroforelasticsearch.alerting.core.model.ScheduledJob
 import com.amazon.opendistroforelasticsearch.alerting.MonitorRunner
 import com.amazon.opendistroforelasticsearch.alerting.model.Monitor
-import com.amazon.opendistroforelasticsearch.alerting.elasticapi.ElasticAPI
 import com.amazon.opendistroforelasticsearch.alerting.AlertingPlugin
+import com.amazon.opendistroforelasticsearch.alerting.elasticapi.ElasticThreadContextElement
+import org.apache.logging.log4j.LogManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.elasticsearch.action.get.GetRequest
 import org.elasticsearch.action.get.GetResponse
 import org.elasticsearch.client.node.NodeClient
 import org.elasticsearch.common.settings.Settings
 import org.elasticsearch.common.unit.TimeValue
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler
 import org.elasticsearch.common.xcontent.XContentParser.Token.START_OBJECT
 import org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken
 import org.elasticsearch.common.xcontent.XContentType
@@ -32,25 +37,28 @@ import org.elasticsearch.rest.BaseRestHandler
 import org.elasticsearch.rest.BaseRestHandler.RestChannelConsumer
 import org.elasticsearch.rest.BytesRestResponse
 import org.elasticsearch.rest.RestChannel
-import org.elasticsearch.rest.RestController
+import org.elasticsearch.rest.RestHandler.Route
 import org.elasticsearch.rest.RestRequest
 import org.elasticsearch.rest.RestRequest.Method.POST
 import org.elasticsearch.rest.RestStatus
 import org.elasticsearch.rest.action.RestActionListener
 import java.time.Instant
 
+private val log = LogManager.getLogger(RestExecuteMonitorAction::class.java)
+
 class RestExecuteMonitorAction(
     val settings: Settings,
-    restController: RestController,
     private val runner: MonitorRunner
-) : BaseRestHandler(settings) {
-
-    init {
-        restController.registerHandler(POST, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}/_execute", this)
-        restController.registerHandler(POST, "${AlertingPlugin.MONITOR_BASE_URI}/_execute", this)
-    }
+) : BaseRestHandler() {
 
     override fun getName(): String = "execute_monitor_action"
+
+    override fun routes(): List<Route> {
+        return listOf(
+                Route(POST, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}/_execute"),
+                Route(POST, "${AlertingPlugin.MONITOR_BASE_URI}/_execute")
+        )
+    }
 
     override fun prepareRequest(request: RestRequest, client: NodeClient): RestChannelConsumer {
         return RestChannelConsumer { channel ->
@@ -58,15 +66,19 @@ class RestExecuteMonitorAction(
             val requestEnd = request.paramAsTime("period_end", TimeValue(Instant.now().toEpochMilli()))
 
             val executeMonitor = fun(monitor: Monitor) {
-                runner.executor().submit {
+                // Launch the coroutine with the clients threadContext. This is needed to preserve authentication information
+                // stored on the threadContext set by the security plugin when using the Alerting plugin with the Security plugin.
+                runner.launch(ElasticThreadContextElement(client.threadPool().threadContext)) {
                     val (periodStart, periodEnd) =
                             monitor.schedule.getPeriodEndingAt(Instant.ofEpochMilli(requestEnd.millis))
                     try {
                         val response = runner.runMonitor(monitor, periodStart, periodEnd, dryrun)
-                        channel.sendResponse(BytesRestResponse(RestStatus.OK, channel.newBuilder().value(response)))
+                        withContext(Dispatchers.IO) {
+                            channel.sendResponse(BytesRestResponse(RestStatus.OK, channel.newBuilder().value(response)))
+                        }
                     } catch (e: Exception) {
-                        logger.error("Unexpected error running monitor", e)
-                        channel.sendResponse(BytesRestResponse(channel, e))
+                        log.error("Unexpected error running monitor", e)
+                        withContext(Dispatchers.IO) { channel.sendResponse(BytesRestResponse(channel, e)) }
                     }
                 }
             }
@@ -97,8 +109,9 @@ class RestExecuteMonitorAction(
                     this.channel.sendResponse(BytesRestResponse(RestStatus.NOT_FOUND, ret))
                 }
 
-                val xcp = ElasticAPI.INSTANCE.createParser(this.channel.request().xContentRegistry,
-                        response.sourceAsBytesRef, this.channel.request().xContentType ?: XContentType.JSON)
+                val xcp = (this.channel.request().xContentType ?: XContentType.JSON).xContent()
+                        .createParser(this.channel.request().xContentRegistry, LoggingDeprecationHandler.INSTANCE,
+                                response.sourceAsBytesRef.streamInput())
                 val monitor = xcp.use {
                     ScheduledJob.parse(xcp, response.id, response.version) as Monitor
                 }

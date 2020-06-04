@@ -13,12 +13,10 @@
  *   permissions and limitations under the License.
  */
 
-rootProject.name = 'opendistro-plugins'
+rootProject.name = 'opendistro-for-elasticsearch-alerting'
 include 'alerting'
 include 'core'
 include 'notification'
-include 'elastic-api'
 
 project(":core").name = 'alerting-core'
 project(":notification").name = 'alerting-notification'
-project(":elastic-api").name = 'alerting-elastic-api'

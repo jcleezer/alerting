@@ -16,21 +16,23 @@ package com.amazon.opendistroforelasticsearch.alerting.resthandler
 
 import com.amazon.opendistroforelasticsearch.alerting.core.model.ScheduledJob
 import com.amazon.opendistroforelasticsearch.alerting.core.model.ScheduledJob.Companion.SCHEDULED_JOBS_INDEX
-import com.amazon.opendistroforelasticsearch.alerting.core.model.ScheduledJob.Companion.SCHEDULED_JOB_TYPE
 import com.amazon.opendistroforelasticsearch.alerting.util._ID
 import com.amazon.opendistroforelasticsearch.alerting.util._VERSION
 import com.amazon.opendistroforelasticsearch.alerting.util.context
-import com.amazon.opendistroforelasticsearch.alerting.elasticapi.ElasticAPI
 import com.amazon.opendistroforelasticsearch.alerting.AlertingPlugin
+import com.amazon.opendistroforelasticsearch.alerting.util._PRIMARY_TERM
+import com.amazon.opendistroforelasticsearch.alerting.util._SEQ_NO
 import org.elasticsearch.action.get.GetRequest
 import org.elasticsearch.action.get.GetResponse
 import org.elasticsearch.client.node.NodeClient
-import org.elasticsearch.common.settings.Settings
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler
+import org.elasticsearch.common.xcontent.XContentHelper
+import org.elasticsearch.common.xcontent.XContentType
 import org.elasticsearch.rest.BaseRestHandler
 import org.elasticsearch.rest.BaseRestHandler.RestChannelConsumer
 import org.elasticsearch.rest.BytesRestResponse
 import org.elasticsearch.rest.RestChannel
-import org.elasticsearch.rest.RestController
+import org.elasticsearch.rest.RestHandler.Route
 import org.elasticsearch.rest.RestRequest
 import org.elasticsearch.rest.RestRequest.Method.GET
 import org.elasticsearch.rest.RestRequest.Method.HEAD
@@ -43,16 +45,18 @@ import org.elasticsearch.search.fetch.subphase.FetchSourceContext
 /**
  * This class consists of the REST handler to retrieve a monitor .
  */
-class RestGetMonitorAction(settings: Settings, controller: RestController) : BaseRestHandler(settings) {
-
-    init {
-        // Get a specific monitor
-        controller.registerHandler(GET, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}", this)
-        controller.registerHandler(HEAD, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}", this)
-    }
+class RestGetMonitorAction : BaseRestHandler() {
 
     override fun getName(): String {
         return "get_monitor_action"
+    }
+
+    override fun routes(): List<Route> {
+        return listOf(
+                // Get a specific monitor
+                Route(GET, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}"),
+                Route(HEAD, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}")
+        )
     }
 
     override fun prepareRequest(request: RestRequest, client: NodeClient): RestChannelConsumer {
@@ -60,9 +64,10 @@ class RestGetMonitorAction(settings: Settings, controller: RestController) : Bas
         if (monitorId == null || monitorId.isEmpty()) {
             throw IllegalArgumentException("missing id")
         }
-        val getRequest = GetRequest(SCHEDULED_JOBS_INDEX, SCHEDULED_JOB_TYPE, monitorId)
+        val getRequest = GetRequest(SCHEDULED_JOBS_INDEX, monitorId)
                 .version(RestActions.parseVersion(request))
                 .fetchSourceContext(context(request))
+
         if (request.method() == HEAD) {
             getRequest.fetchSourceContext(FetchSourceContext.DO_NOT_FETCH_SOURCE)
         }
@@ -81,9 +86,11 @@ class RestGetMonitorAction(settings: Settings, controller: RestController) : Bas
                         .startObject()
                         .field(_ID, response.id)
                         .field(_VERSION, response.version)
+                        .field(_SEQ_NO, response.seqNo)
+                        .field(_PRIMARY_TERM, response.primaryTerm)
                 if (!response.isSourceEmpty) {
-                    ElasticAPI.INSTANCE
-                            .jsonParser(channel.request().xContentRegistry, response.sourceAsBytesRef).use { xcp ->
+                    XContentHelper.createParser(channel.request().xContentRegistry, LoggingDeprecationHandler.INSTANCE,
+                            response.sourceAsBytesRef, XContentType.JSON).use { xcp ->
                                 val monitor = ScheduledJob.parse(xcp, response.id, response.version)
                                 builder.field("monitor", monitor)
                             }

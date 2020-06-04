@@ -16,14 +16,13 @@
 package com.amazon.opendistroforelasticsearch.alerting
 
 import com.amazon.opendistroforelasticsearch.alerting.alerts.AlertIndices
+import com.amazon.opendistroforelasticsearch.alerting.core.model.ScheduledJob
 import com.amazon.opendistroforelasticsearch.alerting.core.model.SearchInput
 import com.amazon.opendistroforelasticsearch.alerting.core.settings.ScheduledJobSettings
-import com.amazon.opendistroforelasticsearch.alerting.elasticapi.ElasticAPI
 import com.amazon.opendistroforelasticsearch.alerting.elasticapi.string
 import com.amazon.opendistroforelasticsearch.alerting.model.Alert
 import com.amazon.opendistroforelasticsearch.alerting.model.Monitor
 import com.amazon.opendistroforelasticsearch.alerting.model.destination.Destination
-import com.amazon.opendistroforelasticsearch.alerting.test.makeRequest
 import com.amazon.opendistroforelasticsearch.alerting.util.DestinationType
 import org.apache.http.HttpEntity
 import org.apache.http.HttpHeaders
@@ -36,6 +35,7 @@ import org.elasticsearch.client.Response
 import org.elasticsearch.client.RestClient
 import org.elasticsearch.common.settings.Settings
 import org.elasticsearch.common.unit.TimeValue
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler
 import org.elasticsearch.common.xcontent.NamedXContentRegistry
 import org.elasticsearch.common.xcontent.ToXContent
 import org.elasticsearch.common.xcontent.XContentFactory
@@ -44,18 +44,27 @@ import org.elasticsearch.common.xcontent.XContentParser
 import org.elasticsearch.common.xcontent.XContentParserUtils
 import org.elasticsearch.common.xcontent.XContentType
 import org.elasticsearch.common.xcontent.json.JsonXContent
+import org.elasticsearch.common.xcontent.json.JsonXContent.jsonXContent
 import org.elasticsearch.rest.RestStatus
 import org.elasticsearch.search.SearchModule
 import org.elasticsearch.test.rest.ESRestTestCase
+import org.junit.AfterClass
 import org.junit.rules.DisableOnDebug
 import java.net.URLEncoder
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Instant
 import java.util.Locale
+import javax.management.MBeanServerInvocationHandler
+import javax.management.ObjectName
+import javax.management.remote.JMXConnectorFactory
+import javax.management.remote.JMXServiceURL
 
 abstract class AlertingRestTestCase : ESRestTestCase() {
 
     private val isDebuggingTest = DisableOnDebug(null).isDebugging
     private val isDebuggingRemoteCluster = System.getProperty("cluster.debug", "false")!!.toBoolean()
+    val numberOfNodes = System.getProperty("cluster.number_of_nodes", "1")!!.toInt()
 
     override fun xContentRegistry(): NamedXContentRegistry {
         return NamedXContentRegistry(mutableListOf(Monitor.XCONTENT_REGISTRY,
@@ -72,7 +81,8 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
                 monitor.toHttpEntity())
         assertEquals("Unable to create a new monitor", RestStatus.CREATED, response.restStatus())
 
-        val monitorJson = ElasticAPI.INSTANCE.jsonParser(NamedXContentRegistry.EMPTY, response.entity.content).map()
+        val monitorJson = jsonXContent.createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE,
+                response.entity.content).map()
         return monitor.copy(id = monitorJson["_id"] as String, version = (monitorJson["_version"] as Int).toLong())
     }
 
@@ -83,7 +93,8 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
                 emptyMap(),
                 destination.toHttpEntity())
         assertEquals("Unable to create a new destination", RestStatus.CREATED, response.restStatus())
-        val destinationJson = ElasticAPI.INSTANCE.jsonParser(NamedXContentRegistry.EMPTY, response.entity.content).map()
+        val destinationJson = jsonXContent.createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE,
+                response.entity.content).map()
         return destination.copy(id = destinationJson["_id"] as String, version = (destinationJson["_version"] as Int).toLong())
     }
 
@@ -94,7 +105,8 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
                 emptyMap(),
                 destination.toHttpEntity())
         assertEquals("Unable to update a destination", RestStatus.OK, response.restStatus())
-        val destinationJson = ElasticAPI.INSTANCE.jsonParser(NamedXContentRegistry.EMPTY, response.entity.content).map()
+        val destinationJson = jsonXContent.createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE,
+                response.entity.content).map()
         return destination.copy(id = destinationJson["_id"] as String, version = (destinationJson["_version"] as Int).toLong())
     }
 
@@ -108,12 +120,25 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
                 customWebhook = null)
     }
 
+    protected fun verifyIndexSchemaVersion(index: String, expectedVersion: Int) {
+        val indexMapping = client().getIndexMapping(index)
+        val indexName = indexMapping.keys.toList()[0]
+        val mappings = indexMapping.stringMap(indexName)?.stringMap("mappings")
+        var version = 0
+        if (mappings!!.containsKey("_meta")) {
+            val meta = mappings.stringMap("_meta")
+            if (meta!!.containsKey("schema_version")) version = meta.get("schema_version") as Int
+        }
+        assertEquals(expectedVersion, version)
+    }
+
     protected fun createAlert(alert: Alert): Alert {
         val response = client().makeRequest("POST", "/${AlertIndices.ALERT_INDEX}/_doc?refresh=true&routing=${alert.monitorId}",
                 emptyMap(), alert.toHttpEntity())
         assertEquals("Unable to create a new alert", RestStatus.CREATED, response.restStatus())
 
-        val alertJson = ElasticAPI.INSTANCE.jsonParser(NamedXContentRegistry.EMPTY, response.entity.content).map()
+        val alertJson = jsonXContent.createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE,
+                response.entity.content).map()
         return alert.copy(id = alertJson["_id"] as String, version = (alertJson["_version"] as Int).toLong())
     }
 
@@ -220,21 +245,29 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
     /** A test index that can be used across tests. Feel free to add new fields but don't remove any. */
     protected fun createTestIndex(index: String = randomAlphaOfLength(10).toLowerCase(Locale.ROOT)): String {
         createIndex(index, Settings.EMPTY, """
-            "_doc" : {
-              "properties" : {
-                 "test_strict_date_time" : { "type" : "date", "format" : "strict_date_time" }
-              }
-            }
+          "properties" : {
+             "test_strict_date_time" : { "type" : "date", "format" : "strict_date_time" }
+          }
         """.trimIndent())
         return index
     }
 
-    fun putAlertMappings() {
-        val mappingHack = AlertIndices.alertMapping().trimStart('{').trimEnd('}')
+    fun putAlertMappings(mapping: String? = null) {
+        val mappingHack = if (mapping != null) mapping else AlertIndices.alertMapping().trimStart('{').trimEnd('}')
         val encodedHistoryIndex = URLEncoder.encode(AlertIndices.HISTORY_INDEX_PATTERN, Charsets.UTF_8.toString())
-        createIndex(AlertIndices.ALERT_INDEX, Settings.EMPTY, mappingHack)
-        createIndex(encodedHistoryIndex, Settings.EMPTY, mappingHack)
-        client().makeRequest("PUT", "/$encodedHistoryIndex/_alias/${AlertIndices.HISTORY_WRITE_INDEX}")
+        val settings = Settings.builder().put("index.hidden", true).build()
+        createIndex(AlertIndices.ALERT_INDEX, settings, mappingHack)
+        createIndex(encodedHistoryIndex, settings, mappingHack, "\"${AlertIndices.HISTORY_WRITE_INDEX}\" : {}")
+    }
+
+    fun scheduledJobMappings(): String {
+        return javaClass.classLoader.getResource("mappings/scheduled-jobs.json").readText()
+    }
+
+    fun createAlertingConfigIndex(mapping: String? = null) {
+        val mappingHack = if (mapping != null) mapping else scheduledJobMappings().trimStart('{').trimEnd('}')
+        val settings = Settings.builder().put("index.hidden", true).build()
+        createIndex(ScheduledJob.SCHEDULED_JOBS_INDEX, settings, mappingHack)
     }
 
     protected fun Response.restStatus(): RestStatus {
@@ -274,7 +307,6 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
     override fun restClientSettings(): Settings {
         return if (isDebuggingTest || isDebuggingRemoteCluster) {
             Settings.builder()
-                    .put(CLIENT_RETRY_TIMEOUT, TimeValue.timeValueMinutes(10))
                     .put(CLIENT_SOCKET_TIMEOUT, TimeValue.timeValueMinutes(10))
                     .build()
         } else {
@@ -284,6 +316,12 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
 
     fun RestClient.getClusterSettings(settings: Map<String, String>): Map<String, Any> {
         val response = this.makeRequest("GET", "_cluster/settings", settings)
+        assertEquals(RestStatus.OK, response.restStatus())
+        return response.asMap()
+    }
+
+    fun RestClient.getIndexMapping(index: String): Map<String, Any> {
+        val response = this.makeRequest("GET", "$index/_mapping")
         assertEquals(RestStatus.OK, response.restStatus())
         return response.asMap()
     }
@@ -335,5 +373,45 @@ abstract class AlertingRestTestCase : ESRestTestCase() {
                         .startObject().field(ScheduledJobSettings.SWEEPER_ENABLED.key, false).endObject()
                         .endObject().string(), ContentType.APPLICATION_JSON))
         return updateResponse
+    }
+
+    companion object {
+        internal interface IProxy {
+            val version: String?
+            var sessionId: String?
+
+            fun getExecutionData(reset: Boolean): ByteArray?
+            fun dump(reset: Boolean)
+            fun reset()
+        }
+
+        /*
+        * We need to be able to dump the jacoco coverage before the cluster shuts down.
+        * The new internal testing framework removed some gradle tasks we were listening to,
+        * to choose a good time to do it. This will dump the executionData to file after each test.
+        * TODO: This is also currently just overwriting integTest.exec with the updated execData without
+        *   resetting after writing each time. This can be improved to either write an exec file per test
+        *   or by letting jacoco append to the file.
+        * */
+        @JvmStatic
+        @AfterClass
+        fun dumpCoverage() {
+            // jacoco.dir set in esplugin-coverage.gradle, if it doesn't exist we don't
+            // want to collect coverage, so we can return early
+            val jacocoBuildPath = System.getProperty("jacoco.dir") ?: return
+            val serverUrl = "service:jmx:rmi:///jndi/rmi://127.0.0.1:7777/jmxrmi"
+            JMXConnectorFactory.connect(JMXServiceURL(serverUrl)).use { connector ->
+                val proxy = MBeanServerInvocationHandler.newProxyInstance(
+                        connector.mBeanServerConnection,
+                        ObjectName("org.jacoco:type=Runtime"),
+                        IProxy::class.java,
+                        false
+                )
+                proxy.getExecutionData(false)?.let {
+                    val path = Path.of("$jacocoBuildPath/integTest.exec")
+                    Files.write(path, it)
+                }
+            }
+        }
     }
 }

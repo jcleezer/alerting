@@ -17,8 +17,8 @@ package com.amazon.opendistroforelasticsearch.alerting.model
 
 import com.amazon.opendistroforelasticsearch.alerting.alerts.AlertError
 import com.amazon.opendistroforelasticsearch.alerting.elasticapi.optionalTimeField
+import org.apache.logging.log4j.LogManager
 import org.elasticsearch.ElasticsearchException
-import org.elasticsearch.common.logging.Loggers
 import org.elasticsearch.common.xcontent.ToXContent
 import org.elasticsearch.common.xcontent.XContentBuilder
 import org.elasticsearch.script.ScriptException
@@ -77,10 +77,12 @@ data class TriggerRunResult(
     val actionResults: MutableMap<String, ActionRunResult> = mutableMapOf()
 ) : ToXContent {
     override fun toXContent(builder: XContentBuilder, params: ToXContent.Params): XContentBuilder {
+        var msg = error?.message
+        if (error is ScriptException) msg = error.toJsonString()
         return builder.startObject()
                 .field("name", triggerName)
                 .field("triggered", triggered)
-                .field("error", error?.message)
+                .field("error", msg)
                 .field("action_results", actionResults as Map<String, ActionRunResult>)
                 .endObject()
     }
@@ -100,23 +102,27 @@ data class TriggerRunResult(
 }
 
 data class ActionRunResult(
+    val actionId: String,
     val actionName: String,
     val output: Map<String, String>,
     val throttled: Boolean = false,
+    val executionTime: Instant? = null,
     val error: Exception? = null
 ) : ToXContent {
 
     override fun toXContent(builder: XContentBuilder, params: ToXContent.Params): XContentBuilder {
         return builder.startObject()
+                .field("id", actionId)
                 .field("name", actionName)
                 .field("output", output)
                 .field("throttled", throttled)
+                .optionalTimeField("executionTime", executionTime)
                 .field("error", error?.message)
                 .endObject()
     }
 }
 
-private val logger = Loggers.getLogger("UserError")
+private val logger = LogManager.getLogger(MonitorRunResult::class.java)
 
 /** Constructs an error message from an exception suitable for human consumption. */
 private fun Throwable.userErrorMessage(): String {

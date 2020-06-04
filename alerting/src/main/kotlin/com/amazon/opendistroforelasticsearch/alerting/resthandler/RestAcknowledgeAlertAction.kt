@@ -22,9 +22,10 @@ import com.amazon.opendistroforelasticsearch.alerting.model.Alert.State.ACTIVE
 import com.amazon.opendistroforelasticsearch.alerting.model.Alert.State.COMPLETED
 import com.amazon.opendistroforelasticsearch.alerting.model.Alert.State.ERROR
 import com.amazon.opendistroforelasticsearch.alerting.util.REFRESH
-import com.amazon.opendistroforelasticsearch.alerting.elasticapi.ElasticAPI
 import com.amazon.opendistroforelasticsearch.alerting.AlertingPlugin
 import com.amazon.opendistroforelasticsearch.alerting.elasticapi.optionalTimeField
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
 import org.elasticsearch.action.ActionListener
 import org.elasticsearch.action.bulk.BulkRequest
 import org.elasticsearch.action.bulk.BulkResponse
@@ -34,17 +35,19 @@ import org.elasticsearch.action.support.WriteRequest
 import org.elasticsearch.action.support.WriteRequest.RefreshPolicy
 import org.elasticsearch.action.update.UpdateRequest
 import org.elasticsearch.client.node.NodeClient
-import org.elasticsearch.common.settings.Settings
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler
 import org.elasticsearch.common.xcontent.XContentBuilder
 import org.elasticsearch.common.xcontent.XContentFactory
+import org.elasticsearch.common.xcontent.XContentHelper
 import org.elasticsearch.common.xcontent.XContentParser
 import org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken
+import org.elasticsearch.common.xcontent.XContentType
 import org.elasticsearch.index.query.QueryBuilders
 import org.elasticsearch.rest.BaseRestHandler
 import org.elasticsearch.rest.BaseRestHandler.RestChannelConsumer
 import org.elasticsearch.rest.BytesRestResponse
 import org.elasticsearch.rest.RestChannel
-import org.elasticsearch.rest.RestController
+import org.elasticsearch.rest.RestHandler.Route
 import org.elasticsearch.rest.RestRequest
 import org.elasticsearch.rest.RestRequest.Method.POST
 import org.elasticsearch.rest.RestStatus
@@ -52,20 +55,24 @@ import org.elasticsearch.search.builder.SearchSourceBuilder
 import java.io.IOException
 import java.time.Instant
 
+private val log: Logger = LogManager.getLogger(RestAcknowledgeAlertAction::class.java)
+
 /**
  * This class consists of the REST handler to acknowledge alerts.
  * The user provides the monitorID to which these alerts pertain and in the content of the request provides
  * the ids to the alerts he would like to acknowledge.
  */
-class RestAcknowledgeAlertAction(settings: Settings, controller: RestController) : BaseRestHandler(settings) {
-
-    init {
-        // Acknowledge alerts
-        controller.registerHandler(POST, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}/_acknowledge/alerts", this)
-    }
+class RestAcknowledgeAlertAction : BaseRestHandler() {
 
     override fun getName(): String {
         return "acknowledge_alert_action"
+    }
+
+    override fun routes(): List<Route> {
+        return listOf(
+                // Acknowledge alerts
+                Route(POST, "${AlertingPlugin.MONITOR_BASE_URI}/{monitorID}/_acknowledge/alerts")
+        )
     }
 
     @Throws(IOException::class)
@@ -98,23 +105,24 @@ class RestAcknowledgeAlertAction(settings: Settings, controller: RestController)
                     .filter(QueryBuilders.termsQuery("_id", alertIds))
             val searchRequest = SearchRequest()
                     .indices(AlertIndices.ALERT_INDEX)
-                    .types(Alert.ALERT_TYPE)
                     .routing(monitorId)
-                    .source(SearchSourceBuilder().query(queryBuilder).version(true))
+                    .source(SearchSourceBuilder().query(queryBuilder).version(true).seqNoAndPrimaryTerm(true))
 
             client.search(searchRequest, ActionListener.wrap(::onSearchResponse, ::onFailure))
         }
 
         private fun onSearchResponse(response: SearchResponse) {
             val updateRequests = response.hits.flatMap { hit ->
-                val xcp = ElasticAPI.INSTANCE.jsonParser(channel.request().xContentRegistry, hit.sourceRef)
+                val xcp = XContentHelper.createParser(channel.request().xContentRegistry, LoggingDeprecationHandler.INSTANCE,
+                        hit.sourceRef, XContentType.JSON)
                 ensureExpectedToken(XContentParser.Token.START_OBJECT, xcp.nextToken(), xcp::getTokenLocation)
                 val alert = Alert.parse(xcp, hit.id, hit.version)
                 alerts[alert.id] = alert
                 if (alert.state == ACTIVE) {
-                    listOf(UpdateRequest(AlertIndices.ALERT_INDEX, AlertIndices.MAPPING_TYPE, hit.id)
+                    listOf(UpdateRequest(AlertIndices.ALERT_INDEX, hit.id)
                             .routing(monitorId)
-                            .version(hit.version)
+                            .setIfSeqNo(hit.seqNo)
+                            .setIfPrimaryTerm(hit.primaryTerm)
                             .doc(XContentFactory.jsonBuilder().startObject()
                                     .field(Alert.STATE_FIELD, ACKNOWLEDGED.toString())
                                     .optionalTimeField(Alert.ACKNOWLEDGED_TIME_FIELD, Instant.now())
@@ -124,7 +132,7 @@ class RestAcknowledgeAlertAction(settings: Settings, controller: RestController)
                 }
             }
 
-            logger.info("Acknowledging monitor: $monitorId, alerts: ${updateRequests.map { it.id() }}")
+            log.info("Acknowledging monitor: $monitorId, alerts: ${updateRequests.map { it.id() }}")
             val request = BulkRequest().add(updateRequests).setRefreshPolicy(refreshPolicy)
             client.bulk(request, ActionListener.wrap(::onBulkResponse, ::onFailure))
         }

@@ -29,16 +29,21 @@ import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.util.EntityUtils;
+import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.logging.Loggers;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.rest.RestStatus;
 
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 
 /**
@@ -46,13 +51,22 @@ import java.util.Map;
  */
 public class DestinationHttpClient {
 
-    private static final Logger logger = Loggers.getLogger(DestinationHttpClient.class);
+    private static final Logger logger = LogManager.getLogger(DestinationHttpClient.class);
 
     private static final int MAX_CONNECTIONS = 60;
     private static final int MAX_CONNECTIONS_PER_ROUTE = 20;
     private static final int TIMEOUT_MILLISECONDS = (int) TimeValue.timeValueSeconds(5).millis();
     private static final int SOCKET_TIMEOUT_MILLISECONDS = (int)TimeValue.timeValueSeconds(50).millis();
 
+    /**
+     * all valid response status
+     */
+    private static final Set<Integer> VALID_RESPONSE_STATUS = Collections.unmodifiableSet(new HashSet<>(
+        Arrays.asList(RestStatus.OK.getStatus(), RestStatus.CREATED.getStatus(), RestStatus.ACCEPTED.getStatus(),
+            RestStatus.NON_AUTHORITATIVE_INFORMATION.getStatus(), RestStatus.NO_CONTENT.getStatus(),
+            RestStatus.RESET_CONTENT.getStatus(), RestStatus.PARTIAL_CONTENT.getStatus(),
+            RestStatus.MULTI_STATUS.getStatus())));
+    
     private static CloseableHttpClient HTTP_CLIENT = createHttpClient();
 
     private static CloseableHttpClient createHttpClient() {
@@ -70,6 +84,7 @@ public class DestinationHttpClient {
                 .setDefaultRequestConfig(config)
                 .setConnectionManager(connectionManager)
                 .setRetryHandler(new DefaultHttpRequestRetryHandler())
+                .useSystemProperties()
                 .build();
     }
 
@@ -108,7 +123,7 @@ public class DestinationHttpClient {
         }
 
         httpPostRequest.setURI(uri);
-        StringEntity entity = new StringEntity(extractBody(message));
+        StringEntity entity = new StringEntity(extractBody(message), StandardCharsets.UTF_8);
         httpPostRequest.setEntity(entity);
 
         return HTTP_CLIENT.execute(httpPostRequest);
@@ -151,7 +166,7 @@ public class DestinationHttpClient {
     private void validateResponseStatus(HttpResponse response) throws IOException {
         int statusCode = response.getStatusLine().getStatusCode();
 
-        if (statusCode != RestStatus.OK.getStatus()) {
+        if (!(VALID_RESPONSE_STATUS.contains(statusCode))) {
             throw new IOException("Failed: " + response);
         }
     }
